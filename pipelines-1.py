@@ -1,11 +1,10 @@
-
 """
-title: Langfuse Filter Pipeline Flush
-author: open-webui + Senka Drobac
-date: 2025-07-24
+title: Langfuse Filter Pipeline
+author: open-webui
+date: 2025-06-16
 version: 1.7.1
 license: MIT
-description: A filter pipeline that uses Langfuse with explicit flush.
+description: A filter pipeline that uses Langfuse.
 requirements: langfuse<3.0.0
 """
 
@@ -237,9 +236,8 @@ class Pipeline:
         return body
 
     async def outlet(self, body: dict, user: Optional[dict] = None) -> dict:
-    self.log(f"Outlet function called with body: {body}")
+        self.log(f"Outlet function called with body: {body}")
 
-    try:
         chat_id = body.get("chat_id")
 
         # Handle temporary chats
@@ -248,12 +246,15 @@ class Pipeline:
             chat_id = f"temporary-session-{session_id}"
 
         metadata = body.get("metadata", {})
+        # Defaulting to 'llm_response' if no task is provided
         task_name = metadata.get("task", "llm_response")
 
+        # Build tags
         tags_list = self._build_tags(task_name)
 
         if chat_id not in self.chat_traces:
             self.log(f"[WARNING] No matching trace found for chat_id: {chat_id}, attempting to re-register.")
+            # Re-run inlet to register if somehow missing
             return await self.inlet(body, user)
 
         trace = self.chat_traces[chat_id]
@@ -275,21 +276,28 @@ class Pipeline:
                     }
                     self.log(f"Usage data extracted: {usage}")
 
+        # Update the trace output with the last assistant message
         trace.update(output=assistant_message)
 
         metadata["type"] = task_name
         metadata["interface"] = "open-webui"
 
         if task_name in self.GENERATION_TASKS:
+            # Determine which model value to use based on the use_model_name valve
             model_id = self.model_names.get(chat_id, {}).get("id", body.get("model"))
             model_name = self.model_names.get(chat_id, {}).get("name", "unknown")
+            
+            # Pick primary model identifier based on valve setting
             model_value = model_name if self.valves.use_model_name_instead_of_id_for_generation else model_id
+            
+            # Add both values to metadata regardless of valve setting
             metadata["model_id"] = model_id
             metadata["model_name"] = model_name
-
+            
+            # If it's an LLM generation
             generation_payload = {
                 "name": f"{task_name}:{str(uuid.uuid4())}",
-                "model": model_value,
+                "model": model_value,   # <-- Use model name or ID based on valve setting
                 "input": body["messages"],
                 "metadata": metadata,
                 "usage": usage,
@@ -303,12 +311,14 @@ class Pipeline:
             trace.generation().end(**generation_payload)
             self.log(f"Generation ended for chat_id: {chat_id}")
         else:
+            # Otherwise log as an event
             event_payload = {
                 "name": f"{task_name}:{str(uuid.uuid4())}",
                 "metadata": metadata,
                 "input": body["messages"],
             }
             if usage:
+                # If you want usage on event as well
                 event_payload["metadata"]["usage"] = usage
 
             if tags_list:
@@ -321,12 +331,3 @@ class Pipeline:
             self.log(f"Event logged for chat_id: {chat_id}")
 
         return body
-
-    finally:
-        # This guarantees Langfuse flushes before response ends
-        try:
-            if self.langfuse:
-                self.log("Forcing Langfuse flush in finally block.")
-                self.langfuse.flush()
-        except Exception as e:
-            print(f"[ERROR] Failed to flush Langfuse: {e}")
