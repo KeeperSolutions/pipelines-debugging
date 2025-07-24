@@ -237,97 +237,104 @@ class Pipeline:
 
     async def outlet(self, body: dict, user: Optional[dict] = None) -> dict:
         self.log(f"Outlet function called with body: {body}")
+        try:
+            chat_id = body.get("chat_id")
 
-        chat_id = body.get("chat_id")
+            # Handle temporary chats
+            if chat_id == "local":
+                session_id = body.get("session_id")
+                chat_id = f"temporary-session-{session_id}"
 
-        # Handle temporary chats
-        if chat_id == "local":
-            session_id = body.get("session_id")
-            chat_id = f"temporary-session-{session_id}"
+            metadata = body.get("metadata", {})
+            # Defaulting to 'llm_response' if no task is provided
+            task_name = metadata.get("task", "llm_response")
 
-        metadata = body.get("metadata", {})
-        # Defaulting to 'llm_response' if no task is provided
-        task_name = metadata.get("task", "llm_response")
+            # Build tags
+            tags_list = self._build_tags(task_name)
 
-        # Build tags
-        tags_list = self._build_tags(task_name)
+            if chat_id not in self.chat_traces:
+                self.log(f"[WARNING] No matching trace found for chat_id: {chat_id}, attempting to re-register.")
+                # Re-run inlet to register if somehow missing
+                return await self.inlet(body, user)
 
-        if chat_id not in self.chat_traces:
-            self.log(f"[WARNING] No matching trace found for chat_id: {chat_id}, attempting to re-register.")
-            # Re-run inlet to register if somehow missing
-            return await self.inlet(body, user)
+            trace = self.chat_traces[chat_id]
 
-        trace = self.chat_traces[chat_id]
+            assistant_message = get_last_assistant_message(body["messages"])
+            assistant_message_obj = get_last_assistant_message_obj(body["messages"])
 
-        assistant_message = get_last_assistant_message(body["messages"])
-        assistant_message_obj = get_last_assistant_message_obj(body["messages"])
+            usage = None
+            if assistant_message_obj:
+                info = assistant_message_obj.get("usage", {})
+                if isinstance(info, dict):
+                    input_tokens = info.get("prompt_eval_count") or info.get("prompt_tokens")
+                    output_tokens = info.get("eval_count") or info.get("completion_tokens")
+                    if input_tokens is not None and output_tokens is not None:
+                        usage = {
+                            "input": input_tokens,
+                            "output": output_tokens,
+                            "unit": "TOKENS",
+                        }
+                        self.log(f"Usage data extracted: {usage}")
 
-        usage = None
-        if assistant_message_obj:
-            info = assistant_message_obj.get("usage", {})
-            if isinstance(info, dict):
-                input_tokens = info.get("prompt_eval_count") or info.get("prompt_tokens")
-                output_tokens = info.get("eval_count") or info.get("completion_tokens")
-                if input_tokens is not None and output_tokens is not None:
-                    usage = {
-                        "input": input_tokens,
-                        "output": output_tokens,
-                        "unit": "TOKENS",
-                    }
-                    self.log(f"Usage data extracted: {usage}")
+            # Update the trace output with the last assistant message
+            trace.update(output=assistant_message)
 
-        # Update the trace output with the last assistant message
-        trace.update(output=assistant_message)
+            metadata["type"] = task_name
+            metadata["interface"] = "open-webui"
 
-        metadata["type"] = task_name
-        metadata["interface"] = "open-webui"
+            if task_name in self.GENERATION_TASKS:
+                # Determine which model value to use based on the use_model_name valve
+                model_id = self.model_names.get(chat_id, {}).get("id", body.get("model"))
+                model_name = self.model_names.get(chat_id, {}).get("name", "unknown")
+                
+                # Pick primary model identifier based on valve setting
+                model_value = model_name if self.valves.use_model_name_instead_of_id_for_generation else model_id
+                
+                # Add both values to metadata regardless of valve setting
+                metadata["model_id"] = model_id
+                metadata["model_name"] = model_name
+                
+                # If it's an LLM generation
+                generation_payload = {
+                    "name": f"{task_name}:{str(uuid.uuid4())}",
+                    "model": model_value,   # <-- Use model name or ID based on valve setting
+                    "input": body["messages"],
+                    "metadata": metadata,
+                    "usage": usage,
+                }
+                if tags_list:
+                    generation_payload["tags"] = tags_list
 
-        if task_name in self.GENERATION_TASKS:
-            # Determine which model value to use based on the use_model_name valve
-            model_id = self.model_names.get(chat_id, {}).get("id", body.get("model"))
-            model_name = self.model_names.get(chat_id, {}).get("name", "unknown")
-            
-            # Pick primary model identifier based on valve setting
-            model_value = model_name if self.valves.use_model_name_instead_of_id_for_generation else model_id
-            
-            # Add both values to metadata regardless of valve setting
-            metadata["model_id"] = model_id
-            metadata["model_name"] = model_name
-            
-            # If it's an LLM generation
-            generation_payload = {
-                "name": f"{task_name}:{str(uuid.uuid4())}",
-                "model": model_value,   # <-- Use model name or ID based on valve setting
-                "input": body["messages"],
-                "metadata": metadata,
-                "usage": usage,
-            }
-            if tags_list:
-                generation_payload["tags"] = tags_list
+                if self.valves.debug:
+                    print(f"[DEBUG] Langfuse generation end request: {json.dumps(generation_payload, indent=2)}")
 
-            if self.valves.debug:
-                print(f"[DEBUG] Langfuse generation end request: {json.dumps(generation_payload, indent=2)}")
+                trace.generation().end(**generation_payload)
+                self.log(f"Generation ended for chat_id: {chat_id}")
+            else:
+                # Otherwise log as an event
+                event_payload = {
+                    "name": f"{task_name}:{str(uuid.uuid4())}",
+                    "metadata": metadata,
+                    "input": body["messages"],
+                }
+                if usage:
+                    # If you want usage on event as well
+                    event_payload["metadata"]["usage"] = usage
 
-            trace.generation().end(**generation_payload)
-            self.log(f"Generation ended for chat_id: {chat_id}")
-        else:
-            # Otherwise log as an event
-            event_payload = {
-                "name": f"{task_name}:{str(uuid.uuid4())}",
-                "metadata": metadata,
-                "input": body["messages"],
-            }
-            if usage:
-                # If you want usage on event as well
-                event_payload["metadata"]["usage"] = usage
+                if tags_list:
+                    event_payload["tags"] = tags_list
 
-            if tags_list:
-                event_payload["tags"] = tags_list
+                if self.valves.debug:
+                    print(f"[DEBUG] Langfuse event end request: {json.dumps(event_payload, indent=2)}")
 
-            if self.valves.debug:
-                print(f"[DEBUG] Langfuse event end request: {json.dumps(event_payload, indent=2)}")
+                trace.event(**event_payload)
+                self.log(f"Event logged for chat_id: {chat_id}")
 
-            trace.event(**event_payload)
-            self.log(f"Event logged for chat_id: {chat_id}")
-
-        return body
+            return body
+        finally:
+            try:
+                if self.langfuse:
+                    self.log("Forcing Langfuse flush in finally block.")
+                    self.langfuse.flush()
+            except Exception as e:
+                print(f"[ERROR] Failed to flush Langfuse: {e}")
