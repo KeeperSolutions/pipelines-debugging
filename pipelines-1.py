@@ -1,6 +1,12 @@
+
 """
-title: Langfuse Filter Pipeline
- new
+title: Langfuse Filter Pipeline Flush
+author: open-webui + Senka Drobac
+date: 2025-07-24
+version: 1.7.1
+license: MIT
+description: A filter pipeline that uses Langfuse with explicit flush.
+requirements: langfuse<3.0.0
 """
 
 from typing import List, Optional
@@ -29,7 +35,9 @@ class Pipeline:
         secret_key: str
         public_key: str
         host: str
+        # New valve that controls whether task names are added as tags:
         insert_tags: bool = True
+        # New valve that controls whether to use model name instead of model ID for generation
         use_model_name_instead_of_id_for_generation: bool = False
         debug: bool = False
 
@@ -44,14 +52,17 @@ class Pipeline:
                 "public_key": os.getenv("LANGFUSE_PUBLIC_KEY", "your-public-key-here"),
                 "host": os.getenv("LANGFUSE_HOST", "https://cloud.langfuse.com"),
                 "use_model_name_instead_of_id_for_generation": os.getenv("USE_MODEL_NAME", "false").lower() == "true",
-                "debug": os.getenv("DEBUG_MODE", "true").lower() == "true",  # Force debug mode
+                "debug": os.getenv("DEBUG_MODE", "false").lower() == "true",
             }
         )
 
         self.langfuse = None
         self.chat_traces = {}
         self.suppressed_logs = set()
+        # Dictionary to store model names for each chat
         self.model_names = {}
+
+        # Only these tasks will be treated as LLM "generations":
         self.GENERATION_TASKS = {"llm_response"}
 
     def log(self, message: str, suppress_repeats: bool = False):
@@ -60,14 +71,14 @@ class Pipeline:
                 if message in self.suppressed_logs:
                     return
                 self.suppressed_logs.add(message)
-            print(f"[DEBUG][Langfuse Pipeline] {message}")
+            print(f"[DEBUG] {message}")
 
     async def on_startup(self):
-        self.log(f"on_startup triggered for {self.name}")
+        self.log(f"on_startup triggered for {__name__}")
         self.set_langfuse()
 
     async def on_shutdown(self):
-        self.log(f"on_shutdown triggered for {self.name}")
+        self.log(f"on_shutdown triggered for {__name__}")
         if self.langfuse:
             self.langfuse.flush()
 
@@ -77,7 +88,6 @@ class Pipeline:
 
     def set_langfuse(self):
         try:
-            self.log(f"Initializing Langfuse with host: {self.valves.host}")
             self.langfuse = Langfuse(
                 secret_key=self.valves.secret_key,
                 public_key=self.valves.public_key,
@@ -86,64 +96,77 @@ class Pipeline:
             )
             self.langfuse.auth_check()
             self.log("Langfuse client initialized successfully.")
-        except UnauthorizedError as e:
-            self.log(f"UnauthorizedError: Invalid Langfuse credentials - {str(e)}")
-            raise
+        except UnauthorizedError:
+            print(
+                "Langfuse credentials incorrect. Please re-enter your Langfuse credentials in the pipeline settings."
+            )
         except Exception as e:
-            self.log(f"Langfuse initialization error: {str(e)}")
-            raise
+            print(
+                f"Langfuse error: {e} Please re-enter your Langfuse credentials in the pipeline settings."
+            )
 
     def _build_tags(self, task_name: str) -> list:
+        """
+        Builds a list of tags based on valve settings, ensuring we always add
+        'open-webui' and skip user_response / llm_response from becoming tags themselves.
+        """
         tags_list = []
         if self.valves.insert_tags:
+            # Always add 'open-webui'
             tags_list.append("open-webui")
+            # Add the task_name if it's not one of the excluded defaults
             if task_name not in ["user_response", "llm_response"]:
                 tags_list.append(task_name)
-        self.log(f"Built tags: {tags_list}")
         return tags_list
 
     async def inlet(self, body: dict, user: Optional[dict] = None) -> dict:
-        self.log(f"Inlet called with body: {json.dumps(body, indent=2)}")
-        self.log(f"User: {user}")
+        if self.valves.debug:
+            print(f"[DEBUG] Received request: {json.dumps(body, indent=2)}")
+
+        self.log(f"Inlet function called with body: {body} and user: {user}")
 
         metadata = body.get("metadata", {})
         chat_id = metadata.get("chat_id", str(uuid.uuid4()))
 
         # Handle temporary chats
         if chat_id == "local":
-            session_id = metadata.get("session_id", str(uuid.uuid4()))
+            session_id = metadata.get("session_id")
             chat_id = f"temporary-session-{session_id}"
-            self.log(f"Generated temporary chat_id: {chat_id}")
 
         metadata["chat_id"] = chat_id
         body["metadata"] = metadata
 
-        # Extract and store model info
+        # Extract and store both model name and ID if available
         model_info = metadata.get("model", {})
         model_id = body.get("model")
+        
+        # Store model information for this chat
         if chat_id not in self.model_names:
             self.model_names[chat_id] = {"id": model_id}
         else:
             self.model_names[chat_id]["id"] = model_id
+            
         if isinstance(model_info, dict) and "name" in model_info:
             self.model_names[chat_id]["name"] = model_info["name"]
-            self.log(f"Stored model info - name: '{model_info.get('name', 'unknown')}', id: '{model_id}' for chat_id: {chat_id}")
+            self.log(f"Stored model info - name: '{model_info['name']}', id: '{model_id}' for chat_id: {chat_id}")
 
         required_keys = ["model", "messages"]
         missing_keys = [key for key in required_keys if key not in body]
         if missing_keys:
-            error_message = f"Error: Missing keys in request body: {', '.join(missing_keys)}"
+            error_message = f"Error: Missing keys in the request body: {', '.join(missing_keys)}"
             self.log(error_message)
             raise ValueError(error_message)
 
         user_email = user.get("email") if user else None
+        # Defaulting to 'user_response' if no task is provided
         task_name = metadata.get("task", "user_response")
-        self.log(f"Task name: {task_name}")
 
+        # Build tags
         tags_list = self._build_tags(task_name)
 
         if chat_id not in self.chat_traces:
             self.log(f"Creating new trace for chat_id: {chat_id}")
+
             trace_payload = {
                 "name": f"chat:{chat_id}",
                 "input": body,
@@ -151,32 +174,38 @@ class Pipeline:
                 "metadata": metadata,
                 "session_id": chat_id,
             }
+
             if tags_list:
                 trace_payload["tags"] = tags_list
 
-            self.log(f"Langfuse trace request: {json.dumps(trace_payload, indent=2)}")
-            try:
-                trace = self.langfuse.trace(**trace_payload)
-                self.chat_traces[chat_id] = trace
-            except Exception as e:
-                self.log(f"Failed to create Langfuse trace: {str(e)}")
-                raise
+            if self.valves.debug:
+                print(f"[DEBUG] Langfuse trace request: {json.dumps(trace_payload, indent=2)}")
+
+            trace = self.langfuse.trace(**trace_payload)
+            self.chat_traces[chat_id] = trace
         else:
             trace = self.chat_traces[chat_id]
             self.log(f"Reusing existing trace for chat_id: {chat_id}")
             if tags_list:
                 trace.update(tags=tags_list)
 
+        # Update metadata with type
         metadata["type"] = task_name
         metadata["interface"] = "open-webui"
 
+        # If it's a task that is considered an LLM generation
         if task_name in self.GENERATION_TASKS:
+            # Determine which model value to use based on the use_model_name valve
             model_id = self.model_names.get(chat_id, {}).get("id", body["model"])
             model_name = self.model_names.get(chat_id, {}).get("name", "unknown")
+            
+            # Pick primary model identifier based on valve setting
             model_value = model_name if self.valves.use_model_name_instead_of_id_for_generation else model_id
+            
+            # Add both values to metadata regardless of valve setting
             metadata["model_id"] = model_id
             metadata["model_name"] = model_name
-
+            
             generation_payload = {
                 "name": f"{task_name}:{str(uuid.uuid4())}",
                 "model": model_value,
@@ -186,14 +215,12 @@ class Pipeline:
             if tags_list:
                 generation_payload["tags"] = tags_list
 
-            self.log(f"Langfuse generation request: {json.dumps(generation_payload, indent=2)}")
-            try:
-                trace.generation(**generation_payload)
-            except Exception as e:
-                self.log(f"Failed to create Langfuse generation: {str(e)}")
-                raise
+            if self.valves.debug:
+                print(f"[DEBUG] Langfuse generation request: {json.dumps(generation_payload, indent=2)}")
 
+            trace.generation(**generation_payload)
         else:
+            # Otherwise, log it as an event
             event_payload = {
                 "name": f"{task_name}:{str(uuid.uuid4())}",
                 "metadata": metadata,
@@ -202,34 +229,31 @@ class Pipeline:
             if tags_list:
                 event_payload["tags"] = tags_list
 
-            self.log(f"Langfuse event request: {json.dumps(event_payload, indent=2)}")
-            try:
-                trace.event(**event_payload)
-            except Exception as e:
-                self.log(f"Failed to create Langfuse event: {str(e)}")
-                raise
+            if self.valves.debug:
+                print(f"[DEBUG] Langfuse event request: {json.dumps(event_payload, indent=2)}")
 
-        self.log("Inlet processing completed")
+            trace.event(**event_payload)
+
         return body
 
     async def outlet(self, body: dict, user: Optional[dict] = None) -> dict:
-        self.log(f"Outlet called with body: {json.dumps(body, indent=2)}")
-        self.log(f"User: {user}")
+    self.log(f"Outlet function called with body: {body}")
 
+    try:
         chat_id = body.get("chat_id")
+
+        # Handle temporary chats
         if chat_id == "local":
-            session_id = body.get("session_id", str(uuid.uuid4()))
+            session_id = body.get("session_id")
             chat_id = f"temporary-session-{session_id}"
-            self.log(f"Generated temporary chat_id: {chat_id}")
 
         metadata = body.get("metadata", {})
         task_name = metadata.get("task", "llm_response")
-        self.log(f"Task name: {task_name}")
 
         tags_list = self._build_tags(task_name)
 
         if chat_id not in self.chat_traces:
-            self.log(f"[WARNING] No matching trace for chat_id: {chat_id}, re-running inlet")
+            self.log(f"[WARNING] No matching trace found for chat_id: {chat_id}, attempting to re-register.")
             return await self.inlet(body, user)
 
         trace = self.chat_traces[chat_id]
@@ -273,13 +297,11 @@ class Pipeline:
             if tags_list:
                 generation_payload["tags"] = tags_list
 
-            self.log(f"Langfuse generation end request: {json.dumps(generation_payload, indent=2)}")
-            try:
-                trace.generation().end(**generation_payload)
-                self.log(f"Generation ended for chat_id: {chat_id}")
-            except Exception as e:
-                self.log(f"Failed to end Langfuse generation: {str(e)}")
-                raise
+            if self.valves.debug:
+                print(f"[DEBUG] Langfuse generation end request: {json.dumps(generation_payload, indent=2)}")
+
+            trace.generation().end(**generation_payload)
+            self.log(f"Generation ended for chat_id: {chat_id}")
         else:
             event_payload = {
                 "name": f"{task_name}:{str(uuid.uuid4())}",
@@ -288,16 +310,23 @@ class Pipeline:
             }
             if usage:
                 event_payload["metadata"]["usage"] = usage
+
             if tags_list:
                 event_payload["tags"] = tags_list
 
-            self.log(f"Langfuse event end request: {json.dumps(event_payload, indent=2)}")
-            try:
-                trace.event(**event_payload)
-                self.log(f"Event logged for chat_id: {chat_id}")
-            except Exception as e:
-                self.log(f"Failed to log Langfuse event: {str(e)}")
-                raise
+            if self.valves.debug:
+                print(f"[DEBUG] Langfuse event end request: {json.dumps(event_payload, indent=2)}")
 
-        self.log("Outlet processing completed")
+            trace.event(**event_payload)
+            self.log(f"Event logged for chat_id: {chat_id}")
+
         return body
+
+    finally:
+        # This guarantees Langfuse flushes before response ends
+        try:
+            if self.langfuse:
+                self.log("Forcing Langfuse flush in finally block.")
+                self.langfuse.flush()
+        except Exception as e:
+            print(f"[ERROR] Failed to flush Langfuse: {e}")
